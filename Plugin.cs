@@ -17,7 +17,7 @@ namespace AutoChallengeSwap
     {
         public const string PluginGuid = "com.tanner.bloobs.autochallengeswap";
         public const string PluginName = "Auto Challenge Swap";
-        public const string PluginVersion = "2.12.0";
+        public const string PluginVersion = "2.13.0";
 
         internal static ManualLogSource Log;
 
@@ -424,6 +424,7 @@ namespace AutoChallengeSwap
             _combatSignature = null;
             _combatSeen.Clear();
             _modManaged.Clear();
+            _ladderCache.Clear();
             _adopted = false;
             _lastPrimaryTime = -9999f;
         }
@@ -661,23 +662,72 @@ namespace AutoChallengeSwap
             });
         }
 
-        // Find a challenge by type + target, preferring an exact skill match when one is given.
+        // Combat challenges form a ladder that shares a category+skill: e.g. every "Deal Ranged
+        // Damage" challenge is type=Damage, category="Damage", skill="Ranged", differing only by
+        // the skill level it unlocks at (Lvl 1, 26, 51, ...). The game credits progress to ALL
+        // tracked matches; this decides which one to track. Per design we climb the ladder: track
+        // the HIGHEST challenge the player has UNLOCKED (so as new rungs unlock the mod moves up
+        // to them, chasing the biggest long-term payout), preferring one that still has tiers left
+        // over a maxed/repeatable one. Locked challenges are never returned, so the mod can't grant
+        // progress the player hasn't earned. (The old logic returned the FIRST category+skill match
+        // and then camped/looped it forever — it never advanced to higher siblings as they unlocked.)
         private static ChallengeData FindChallenge(ChallengeType type, string target, string skill)
         {
-            var all = Plugin.AllChallenges;
-            if (all == null)
+            if (Plugin.AllChallenges == null)
                 return ChallengeManager.Instance?.GetChallengeByTarget(target, type);
 
-            ChallengeData fallback = null;
-            foreach (var c in all)
+            var mgr = ChallengeManager.Instance;
+            var pdm = playerDataManager.Instance;
+
+            ChallengeData bestIncomplete = null, bestRepeatable = null;
+            foreach (var c in GetLadder(type, target, skill))
             {
-                if (c == null || c.type != type || !NameMatches(c, target)) continue;
-                if (!string.IsNullOrEmpty(skill) && !string.IsNullOrEmpty(c.skill) &&
-                    c.skill.Equals(skill, StringComparison.OrdinalIgnoreCase))
-                    return c;
-                fallback = fallback ?? c;
+                // Unlocked (mirrors the game's Locked gate) and otherwise trackable
+                // (exclusions / RespectAutoProgress / not a maxed non-repeatable).
+                if (!ChallengeUIManager.MeetsLevelRequirement(pdm, c)) continue;
+                if (mgr != null && !IsTrackable(mgr, c)) continue;
+
+                if (mgr != null && mgr.IsFullyCompleted(c.challengeId))
+                {
+                    if (bestRepeatable == null || c.levelRequired > bestRepeatable.levelRequired) bestRepeatable = c;
+                }
+                else if (bestIncomplete == null || c.levelRequired > bestIncomplete.levelRequired)
+                {
+                    bestIncomplete = c;
+                }
             }
-            return fallback;
+            // Highest unlocked with tiers remaining; else highest unlocked repeatable; else none
+            // (bail rather than track a locked or maxed-non-repeatable challenge).
+            return bestIncomplete ?? bestRepeatable;
+        }
+
+        // All challenges sharing a (type, category/target, skill) ladder. The membership never
+        // changes during a session (it's static game data), so we scan the full list once per
+        // ladder and reuse it — the per-hit work then only touches the ~12 siblings, not every
+        // challenge in the game. Cleared on save load (ResetSessionState) for safety.
+        private static readonly Dictionary<string, List<ChallengeData>> _ladderCache =
+            new Dictionary<string, List<ChallengeData>>();
+
+        private static List<ChallengeData> GetLadder(ChallengeType type, string target, string skill)
+        {
+            string key = (int)type + "|" + (target ?? "") + "|" + (skill ?? "");
+            if (_ladderCache.TryGetValue(key, out var list)) return list;
+
+            list = new List<ChallengeData>();
+            var all = Plugin.AllChallenges;
+            if (all != null)
+                foreach (var c in all)
+                {
+                    if (c == null || c.type != type || !NameMatches(c, target)) continue;
+                    // Combat is style-specific (melee Hit=Attack/Damage=Strength, ranged=Ranged,
+                    // magic=Magic); only match the skill that produced this progress. Mitigation
+                    // passes skill=null and category-only challenges have empty skill — both match.
+                    if (!string.IsNullOrEmpty(skill) && !string.IsNullOrEmpty(c.skill) &&
+                        !c.skill.Equals(skill, StringComparison.OrdinalIgnoreCase)) continue;
+                    list.Add(c);
+                }
+            _ladderCache[key] = list;
+            return list;
         }
 
         // The kill category the game will credit — mirrors BasicEnemy.GetKillCategory exactly.
