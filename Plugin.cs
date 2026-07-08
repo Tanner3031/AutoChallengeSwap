@@ -8,7 +8,10 @@ using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.Networking;
+using UnityEngine.UI;
+using TMPro;
 
 namespace AutoChallengeSwap
 {
@@ -17,7 +20,7 @@ namespace AutoChallengeSwap
     {
         public const string PluginGuid = "com.tanner.bloobs.autochallengeswap";
         public const string PluginName = "Auto Challenge Swap";
-        public const string PluginVersion = "2.13.0";
+        public const string PluginVersion = "2.14.0";
 
         internal static ManualLogSource Log;
 
@@ -281,12 +284,152 @@ namespace AutoChallengeSwap
                 string releasesUrl = $"https://github.com/{GitHubOwner}/{GitHubRepo}/releases/latest";
                 Plugin.Log.LogWarning($"{pluginName}: update available — v{latest} (you have v{currentVersion}). {releasesUrl}");
 
-                // Wait until the challenge UI exists, then show a single in-game notice.
+                // Wait until the game UI / EventSystem exists, then show a persistent clickable notice.
                 float t = 0f;
                 while (ChallengeManager.Instance == null && t < 90f) { t += Time.unscaledDeltaTime; yield return null; }
-                ChallengeManager.Instance?.ShowMessage(
-                    $"<color=#66CCFF>{pluginName}</color> update available: <color=yellow>v{latest}</color> — see GitHub.");
+                UpdateNotice.Show(
+                    $"<b>{pluginName}</b> update available: <color=#FFE066>v{latest}</color>\n" +
+                    "<size=80%><color=#9FB3C8>Left-click to open GitHub  ·  right-click or ✕ to dismiss</color></size>",
+                    releasesUrl);
             }
+        }
+    }
+
+    // A persistent, clickable "update available" panel. Unlike the game's transient toast it
+    // stays on screen until the user dismisses it: left-click opens the GitHub releases page,
+    // right-click or the ✕ button closes it. It builds its own top-most overlay canvas so it
+    // doesn't depend on any game UI.
+    internal class UpdateNotice : MonoBehaviour, IPointerClickHandler
+    {
+        private const string RootName = "BloobsModUpdateNotice";
+        private string _url;
+
+        // Count notices already on screen. Every Bloobs mod names its notice root the same, so
+        // this also sees notices from a sibling mod and lets the new one stack below instead of
+        // overlapping it.
+        private static int CountExisting()
+        {
+            int n = 0;
+            foreach (var c in Resources.FindObjectsOfTypeAll<Canvas>())
+                if (c != null && c.gameObject != null && c.gameObject.name == RootName) n++;
+            return n;
+        }
+
+        public static void Show(string message, string url)
+        {
+            try
+            {
+                // Clicks need an EventSystem; the game has one, but create a fallback just in case.
+                if (EventSystem.current == null)
+                {
+                    var es = new GameObject("BloobsModEventSystem",
+                        typeof(EventSystem), typeof(StandaloneInputModule));
+                    DontDestroyOnLoad(es);
+                }
+
+                int slot = CountExisting();
+                var go = new GameObject(RootName);
+                DontDestroyOnLoad(go);
+
+                var canvas = go.AddComponent<Canvas>();
+                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                canvas.sortingOrder = 30000; // above game UI
+                var scaler = go.AddComponent<CanvasScaler>();
+                scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+                scaler.referenceResolution = new Vector2(1920f, 1080f);
+                go.AddComponent<GraphicRaycaster>();
+
+                var notice = go.AddComponent<UpdateNotice>();
+                notice._url = url;
+                notice.Build(message, slot);
+            }
+            catch (Exception ex) { Plugin.Log.LogError("UpdateNotice failed: " + ex); }
+        }
+
+        private void Build(string message, int slot)
+        {
+            TMP_FontAsset font = ResolveFont();
+
+            // Panel, pinned to the top-right corner. This is the click surface; because this
+            // component (IPointerClickHandler) sits on the parent canvas, clicks on the panel
+            // bubble up to OnPointerClick, while the ✕ button (its own handler) does not.
+            var panel = new GameObject("Panel", typeof(RectTransform), typeof(Image));
+            panel.transform.SetParent(transform, false);
+            var prt = panel.GetComponent<RectTransform>();
+            prt.anchorMin = prt.anchorMax = prt.pivot = new Vector2(1f, 1f);
+            prt.anchoredPosition = new Vector2(-24f, -24f - slot * 108f);
+            prt.sizeDelta = new Vector2(390f, 96f);
+            panel.GetComponent<Image>().color = new Color(0.07f, 0.09f, 0.13f, 0.97f);
+
+            // Accent bar down the left edge.
+            var accent = new GameObject("Accent", typeof(RectTransform), typeof(Image));
+            accent.transform.SetParent(panel.transform, false);
+            var art = accent.GetComponent<RectTransform>();
+            art.anchorMin = new Vector2(0f, 0f); art.anchorMax = new Vector2(0f, 1f);
+            art.pivot = new Vector2(0f, 0.5f);
+            art.sizeDelta = new Vector2(5f, 0f); art.anchoredPosition = Vector2.zero;
+            var ai = accent.GetComponent<Image>();
+            ai.color = new Color(0.40f, 0.80f, 1f, 1f);
+            ai.raycastTarget = false;
+
+            // Message text.
+            var textGo = new GameObject("Text", typeof(RectTransform));
+            textGo.transform.SetParent(panel.transform, false);
+            var trt = textGo.GetComponent<RectTransform>();
+            trt.anchorMin = new Vector2(0f, 0f); trt.anchorMax = new Vector2(1f, 1f);
+            trt.offsetMin = new Vector2(16f, 8f); trt.offsetMax = new Vector2(-30f, -8f);
+            var txt = textGo.AddComponent<TextMeshProUGUI>();
+            if (font != null) txt.font = font;
+            txt.fontSize = 18f;
+            txt.color = Color.white;
+            txt.alignment = TextAlignmentOptions.Left;
+            txt.richText = true;
+            txt.raycastTarget = false; // let the panel receive the click
+            txt.text = message;
+
+            // Close (✕) button, top-right. Its own click handler dismisses without opening the URL.
+            var closeGo = new GameObject("Close", typeof(RectTransform), typeof(Image), typeof(Button));
+            closeGo.transform.SetParent(panel.transform, false);
+            var crt = closeGo.GetComponent<RectTransform>();
+            crt.anchorMin = crt.anchorMax = crt.pivot = new Vector2(1f, 1f);
+            crt.anchoredPosition = new Vector2(-5f, -5f);
+            crt.sizeDelta = new Vector2(22f, 22f);
+            closeGo.GetComponent<Image>().color = new Color(1f, 1f, 1f, 0.08f);
+            closeGo.GetComponent<Button>().onClick.AddListener(Dismiss);
+
+            var xGo = new GameObject("X", typeof(RectTransform));
+            xGo.transform.SetParent(closeGo.transform, false);
+            var xrt = xGo.GetComponent<RectTransform>();
+            xrt.anchorMin = Vector2.zero; xrt.anchorMax = Vector2.one;
+            xrt.offsetMin = Vector2.zero; xrt.offsetMax = Vector2.zero;
+            var xtxt = xGo.AddComponent<TextMeshProUGUI>();
+            if (font != null) xtxt.font = font;
+            xtxt.text = "✕";
+            xtxt.fontSize = 15f;
+            xtxt.color = new Color(1f, 1f, 1f, 0.85f);
+            xtxt.alignment = TextAlignmentOptions.Center;
+            xtxt.raycastTarget = false;
+        }
+
+        private static TMP_FontAsset ResolveFont()
+        {
+            var f = TMP_Settings.defaultFontAsset;
+            if (f != null) return f;
+            foreach (var t in Resources.FindObjectsOfTypeAll<TMP_Text>())
+                if (t != null && t.font != null) return t.font;
+            return null;
+        }
+
+        public void OnPointerClick(PointerEventData e)
+        {
+            if (e.button == PointerEventData.InputButton.Right) { Dismiss(); return; }
+            if (e.button == PointerEventData.InputButton.Left && !string.IsNullOrEmpty(_url))
+                Application.OpenURL(_url);
+        }
+
+        private void Dismiss()
+        {
+            if (this != null && gameObject != null) Destroy(gameObject);
         }
     }
 
