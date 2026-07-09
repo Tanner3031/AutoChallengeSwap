@@ -20,7 +20,7 @@ namespace AutoChallengeSwap
     {
         public const string PluginGuid = "com.tanner.bloobs.autochallengeswap";
         public const string PluginName = "Auto Challenge Swap";
-        public const string PluginVersion = "2.14.0";
+        public const string PluginVersion = "2.15.0";
 
         internal static ManualLogSource Log;
 
@@ -37,6 +37,7 @@ namespace AutoChallengeSwap
         internal static ConfigEntry<bool> AutoRepeatables;
         internal static ConfigEntry<bool> EvictManualChallenges;
         internal static ConfigEntry<bool> FillEmptyWithAmbient;
+        internal static ConfigEntry<string> BackgroundFillRaw;
         internal static ConfigEntry<bool> SuppressNotifications;
         internal static ConfigEntry<bool> RespectAutoProgress;
         internal static ConfigEntry<int> AmbientIdleSeconds;
@@ -86,6 +87,8 @@ namespace AutoChallengeSwap
                 "If false, challenges you tracked by hand are never auto-removed. If true, any slot may be swapped.");
             FillEmptyWithAmbient = Config.Bind("2 - Behavior", "FillEmptyWithAmbient", true,
                 "Let non-excluded passive challenges (e.g. Travel Distance) fill EMPTY leftover slots. They never evict anything.");
+            BackgroundFillRaw = Config.Bind("2 - Behavior", "BackgroundFillSkills", "SoulBinding",
+                "Comma-separated skills whose XP challenges fill any leftover slot during ANY activity (even while actively skilling), not just when idle. For passive/background skills like SoulBinding that progress on their own. These bypass the idle timer and the per-skill exclusion below. They still only fill genuinely empty slots and never evict anything. Leave blank to disable.");
             PreferNearestCompletion = Config.Bind("2 - Behavior", "PreferNearestCompletion", true,
                 "When challenges compete for limited slots (esp. combat), prefer the ones closest to finishing their current tier so you clear challenges (and unlock slots) faster.");
             RespectAutoProgress = Config.Bind("2 - Behavior", "RespectAutoProgress", true,
@@ -190,6 +193,7 @@ namespace AutoChallengeSwap
         internal static HashSet<ChallengeType> ExcludedTypes = new HashSet<ChallengeType>();
         internal static HashSet<ChallengeType> LowPriorityTypes = new HashSet<ChallengeType>();
         internal static HashSet<string> ExtraExcludedSkills = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        internal static HashSet<string> BackgroundFillSkills = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         internal static HashSet<string> Locked = new HashSet<string>(StringComparer.Ordinal);
 
         private static bool _persisting;
@@ -203,6 +207,9 @@ namespace AutoChallengeSwap
             ExtraExcludedSkills = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string s in Split(ExcludedSkillsRaw.Value))
                 ExtraExcludedSkills.Add(s);
+            BackgroundFillSkills = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string s in Split(BackgroundFillRaw.Value))
+                BackgroundFillSkills.Add(s);
             if (!_persisting)
             {
                 Locked = new HashSet<string>(Split(LockedIdsRaw.Value), StringComparer.Ordinal);
@@ -712,6 +719,9 @@ namespace AutoChallengeSwap
             // Rank so the best challenges win contested slots.
             var desired = Prioritize(mgr, active);
 
+            // Passive background skills (e.g. SoulBinding) fill any slot combat leaves open.
+            AppendBackgroundFills(mgr, desired);
+
             string sig = string.Join(",", desired.Select(d => d.challengeId));
             if (sig == _combatSignature) return; // nothing changed — avoid per-swing churn
             _combatSignature = sig;
@@ -743,6 +753,10 @@ namespace AutoChallengeSwap
             // only within free budget and won't evict manual picks).
             AddIfTrackable(mgr, mgr.GetChallengeByTarget("Total Experience", ChallengeType.Experience), desired);
 
+            // Fill any slot still open after the activity's own challenges with passive
+            // background skills (e.g. SoulBinding). Lowest priority, free-budget only.
+            AppendBackgroundFills(mgr, desired);
+
             if (desired.Count == 0) return;
 
             _currentActionKey = key;
@@ -754,15 +768,36 @@ namespace AutoChallengeSwap
         // only once you've been idle from real activities for AmbientIdleSeconds.
         private static void HandleAmbient(ChallengeManager mgr, ChallengeType type, string target)
         {
-            if (Time.time - _lastPrimaryTime < Plugin.AmbientIdleSeconds.Value) return;
+            // Background-fill skills (e.g. SoulBinding) skip the idle wait — they progress
+            // passively and never compete with what you're actively doing.
+            bool isBackground = type == ChallengeType.Experience && Plugin.BackgroundFillSkills.Contains(target);
+            if (!isBackground && Time.time - _lastPrimaryTime < Plugin.AmbientIdleSeconds.Value) return;
             if (mgr.TrackedCount >= mgr.MaxTrackedCount) return;
 
             ChallengeData c = mgr.GetChallengeByTarget(target, type);
-            if (c == null || !IsTrackable(mgr, c)) return;
+            if (c == null) return;
+            // Background fill bypasses the per-skill exclusion (listing it is the opt-in);
+            // everything else must pass the normal trackable test.
+            if (isBackground ? !IsFillable(mgr, c) : !IsTrackable(mgr, c)) return;
             if (mgr.IsTracked(c.challengeId)) return;
             if (mgr.GetConflictingTracked(c) != null) return;
 
             DoSuppressed(() => { if (mgr.TryTrack(c)) _modManaged.Add(c.challengeId); });
+        }
+
+        // The XP challenges for the configured background-fill skills, in list order, that are
+        // currently fillable and not already in `desired`. Appended as lowest priority so they
+        // only ever land in a genuinely open slot (ApplyDesired fills within free budget).
+        private static void AppendBackgroundFills(ChallengeManager mgr, List<ChallengeData> desired)
+        {
+            if (Plugin.BackgroundFillSkills.Count == 0) return;
+            var have = new HashSet<string>(desired.Select(d => d.challengeId));
+            foreach (string skill in Plugin.BackgroundFillSkills)
+            {
+                var c = mgr.GetChallengeByTarget(skill, ChallengeType.Experience);
+                if (c != null && IsFillable(mgr, c) && have.Add(c.challengeId))
+                    desired.Add(c);
+            }
         }
 
         // Make the tracked set match `desired` (priority order), within budget, without
@@ -937,6 +972,21 @@ namespace AutoChallengeSwap
             }
             if (!AutoProgressAllows(mgr, c)) return false;
             return true;
+        }
+
+        // Like IsTrackable but ignores the per-skill NAME exclusion — used for background-fill
+        // skills, whose presence in the BackgroundFillSkills list is itself the opt-in. Still
+        // respects type exclusion, completion/repeatable rules, and the Auto Progress depth cap.
+        private static bool IsFillable(ChallengeManager mgr, ChallengeData c)
+        {
+            if (Plugin.ExcludedTypes.Contains(c.type)) return false;
+            string id = c.challengeId;
+            if (mgr.IsFullyCompleted(id))
+            {
+                if (!mgr.IsRepeatable(id)) return false;
+                if (!Plugin.AutoRepeatables.Value) return false;
+            }
+            return AutoProgressAllows(mgr, c);
         }
 
         // Integrity: don't let the mod auto-track a challenge deeper than the player's purchased
