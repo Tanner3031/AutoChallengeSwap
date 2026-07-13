@@ -20,7 +20,7 @@ namespace AutoChallengeSwap
     {
         public const string PluginGuid = "com.tanner.bloobs.autochallengeswap";
         public const string PluginName = "Auto Challenge Swap";
-        public const string PluginVersion = "2.15.0";
+        public const string PluginVersion = "2.16.0";
 
         internal static ManualLogSource Log;
 
@@ -463,6 +463,12 @@ namespace AutoChallengeSwap
         // session). Adopt them the first time the mod acts so it can reorganize them.
         private static bool _adopted;
 
+        // The momentary kill-swap the prefix performed this Die() call, released by the postfix.
+        // _killTracked is the Kill challenge tracked just to credit the kill; _killBorrowedVictim
+        // is the slot lent to it (if any), re-tracked on release so the slots end up unchanged.
+        private static ChallengeData _killTracked;
+        private static ChallengeData _killBorrowedVictim;
+
         internal static bool Suppressing;
 
         internal static void ForceRecomputeNext()
@@ -653,22 +659,75 @@ namespace AutoChallengeSwap
 
                 DoSuppressed(() =>
                 {
+                    ChallengeData victim = null;
                     if (mgr.TrackedCount >= mgr.MaxTrackedCount)
                     {
-                        ChallengeData victim = PickKillBorrow(mgr);
-                        if (victim == null) return; // only manual picks left — respect them
+                        victim = PickKillBorrow(mgr);
+                        if (victim == null) return; // only manual picks left, respect them
                         mgr.Abandon(victim);
                         _modManaged.Remove(victim.challengeId);
                     }
-                    if (mgr.TryTrack(kill)) _modManaged.Add(kill.challengeId);
+                    if (mgr.TryTrack(kill))
+                    {
+                        _modManaged.Add(kill.challengeId);
+                        // Remember what to undo in the postfix once Die() has credited the kill.
+                        _killTracked = kill;
+                        _killBorrowedVictim = victim;
+                    }
+                    else if (victim != null)
+                    {
+                        // Track failed after we borrowed: put the victim straight back so its
+                        // slot isn't stranded (the old code leaned on a later recompute for this).
+                        if (mgr.TryTrack(victim)) _modManaged.Add(victim.challengeId);
+                    }
                 });
-                // Force the next action/combat event to rebuild, restoring the borrowed slot.
-                _currentActionKey = null;
-                _combatSignature = null;
             }
             catch (Exception ex)
             {
                 Plugin.Log.LogError("Kill-swap error: " + ex);
+            }
+        }
+
+        // ---- Kill credited: release the momentary slot the prefix borrowed -----------
+        // Die() credits the kill synchronously (BasicEnemy.Die -> ChallengeManager.AddProgress),
+        // so by this postfix the kill has already counted. Undo the swap right here, in the same
+        // Die() call, instead of waiting for the next combat/action event. That delay was the turbo
+        // bug: at high speed enemies die faster than the next event fires, so the borrowed slot
+        // stayed occupied and rapid back-to-back kills found no slot to borrow and were skipped.
+        // Releasing now frees the slot instantly, so every kill in a burst gets its moment.
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(BasicEnemy), "Die")]
+        private static void Die_Postfix()
+        {
+            var kill = _killTracked;
+            if (kill == null) return; // prefix didn't swap on this death
+            var victim = _killBorrowedVictim;
+            _killTracked = null;
+            _killBorrowedVictim = null;
+
+            var mgr = ChallengeManager.Instance;
+            if (mgr == null) return;
+            try
+            {
+                DoSuppressed(() =>
+                {
+                    // Drop the momentary kill track (it was only there to make the kill count).
+                    if (mgr.IsTracked(kill.challengeId))
+                    {
+                        mgr.Abandon(kill);
+                        _modManaged.Remove(kill.challengeId);
+                    }
+                    // Restore the exact slot we borrowed, so the tracked set is unchanged overall.
+                    if (victim != null && !mgr.IsTracked(victim.challengeId) &&
+                        mgr.GetConflictingTracked(victim) == null &&
+                        mgr.TrackedCount < mgr.MaxTrackedCount &&
+                        mgr.TryTrack(victim))
+                        _modManaged.Add(victim.challengeId);
+                });
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError("Kill-swap restore error: " + ex);
             }
         }
 
